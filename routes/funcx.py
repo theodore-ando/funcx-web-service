@@ -351,6 +351,9 @@ def status_and_result(user_name, task_id):
     if task_result is None:
         del response['result']
 
+    if task_exception is None:
+        del response['exception']
+
     return jsonify(response)
 
 
@@ -869,8 +872,9 @@ def reg_function(user_name, user_uuid):
             function_name,
             e)
         app.logger.error(message)
-        return jsonify({'status': 'Failed',
-                        'reason': message})
+        return jsonify({'status': 'Failed ingest',
+                        'reason': message,
+                        'function_uuid': function_uuid})
 
     return response
 

@@ -13,6 +13,7 @@ api/*
 .idea/*
 forwarder/.idea/*
 forwarder/.idea/forwarder.iml
+dockers/secrets/
 *.iml
 
 # Byte-compiled / optimized / DLL files
