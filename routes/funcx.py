@@ -1,27 +1,25 @@
-import traceback
-import requests
+import json
+import time
 import uuid
+import requests
 
-from models.tasks import TaskState, Task
-from version import VERSION
-from errors import *
+from flask import current_app as app, Blueprint, jsonify, request, abort, send_from_directory, g
+from forwarder.forwarder.errors import RegistrationError
 
-from authentication.auth import authorize_endpoint, authenticated, authorize_function, authenticated_w_uuid
+from authentication.auth import authenticated_w_uuid
+from authentication.auth import authorize_endpoint, authenticated, authorize_function
 from errors import *
 from models.serializer import serialize_inputs, deserialize_result
+from models.tasks import Task
 from models.utils import register_container, get_redis_client
 from models.utils import register_endpoint, register_function, get_container, resolve_user, ingest_function
 from models.utils import resolve_function, db_invocation_logger
 from models.utils import (update_function, delete_function, delete_endpoint, get_ep_whitelist,
-                         add_ep_whitelist, delete_ep_whitelist)
+                          add_ep_whitelist, delete_ep_whitelist)
+from version import VERSION
+from .redis_q import EndpointQueue
 
-from models.serializer import serialize_inputs, deserialize_result
-
-from authentication.auth import authorize_endpoint, authenticated, authorize_function
-from flask import current_app as app, Blueprint, jsonify, request, abort, send_from_directory, g
-
-from .redis_q import RedisQueue, EndpointQueue
-
+from funcx.version import VERSION as FUNCX_VERSION
 
 # Flask
 funcx_api = Blueprint("routes", __name__)
@@ -261,7 +259,6 @@ def submit_batch(user_name):
 
 
 def get_tasks_from_redis(task_ids):
-
     all_tasks = {}
 
     rc = get_redis_client()
@@ -292,8 +289,13 @@ def get_tasks_from_redis(task_ids):
 
         # Note: this is for backwards compat, when we can't include a None result and have a
         # non-complete status, we must forgo the result field if task not complete.
-        if not task_result:
+        if task_result is None:
             del all_tasks[task_id]['result']
+
+        # Note: this is for backwards compat, when we can't include a None result and have a
+        # non-complete status, we must forgo the result field if task not complete.
+        if task_exception is None:
+            del all_tasks[task_id]['exception']
     return all_tasks
 
 
@@ -376,7 +378,6 @@ def status(user_name, task_id):
 
     if not Task.exists(rc, task_id):
         abort(400, "task_id not found")
-
     task = Task.from_id(rc, task_id)
 
     return jsonify({
@@ -580,9 +581,10 @@ def register_with_hub(address, endpoint_id, endpoint_address):
        Address of the forwarder service of the form http://<IP_Address>:<Port>
 
     """
+    print(address + '/register')
     r = requests.post(address + '/register',
                       json={'endpoint_id': endpoint_id,
-                            'redis_address': 'funcx-redis.wtgh6h.0001.use1.cache.amazonaws.com',
+                            'redis_address': app.config['REDIS_HOST'],
                             'endpoint_addr': endpoint_address,
                             }
                       )
@@ -594,9 +596,35 @@ def register_with_hub(address, endpoint_id, endpoint_address):
     return r.json()
 
 
+def get_forwarder_version():
+    forwarder_ip = app.config['FORWARDER_IP']
+    r = requests.get(f"http://{forwarder_ip}:8080/version")
+    return r.json()
+
+
 @funcx_api.route("/version", methods=['GET'])
 def get_version():
-    return jsonify(VERSION)
+    s = request.args.get("service")
+    if s == "api" or s is None:
+        return jsonify(VERSION)
+    elif s == "funcx":
+        return jsonify(FUNCX_VERSION)
+
+    forwarder_v_info = get_forwarder_version()
+    forwarder_version = forwarder_v_info['forwarder']
+    min_ep_version = forwarder_v_info['min_ep_version']
+    if s == 'forwarder':
+        return jsonify(forwarder_version)
+
+    if s == 'all':
+        return jsonify({
+            "api": VERSION,
+            "funcx": FUNCX_VERSION,
+            "forwarder": forwarder_version,
+            "min_ep_version": min_ep_version
+        })
+
+    abort(400, "unknown service type or other error.")
 
 
 @funcx_api.route("/addr", methods=['GET'])
@@ -730,7 +758,7 @@ def get_ep_stats(user_name, endpoint_id):
                 status['logs'].append(json.loads(i))
 
             # timestamp is created using time.time(), which returns seconds since epoch UTC
-            logs = status['logs'] # should have been json loaded already
+            logs = status['logs']  # should have been json loaded already
             newest_timestamp = logs[0]['timestamp']
             now = time.time()
             if now - newest_timestamp < alive_threshold:
@@ -756,8 +784,13 @@ def register_endpoint_2(user_name):
     """
     app.logger.debug("register_endpoint_2 triggered")
 
-    if not user_name:
-        abort(400, description="Error: You must be logged in to perform this function.")
+    v_info = get_forwarder_version()
+    min_ep_version = v_info['min_ep_version']
+    if 'version' not in request.json:
+        abort(400, "Endpoint funcx version must be passed in the 'version' field.")
+
+    if request.json['version'] < min_ep_version:
+        abort(400, f"Endpoint is out of date. Minimum supported endpoint version is {min_ep_version}")
 
     # Cooley ALCF is the default used here.
     endpoint_ip_addr = '140.221.68.108'
@@ -795,6 +828,7 @@ def register_endpoint_2(user_name):
             f"http://{forwarder_ip}:8080", endpoint_uuid, endpoint_ip_addr)
     except Exception as e:
         app.logger.debug("Caught error during forwarder initialization")
+        app.logger.error(e, exc_info=True)
         response = {'status': 'error',
                     'reason': f'Failed during broker start {e}'}
 
@@ -848,7 +882,7 @@ def reg_function(user_name, user_uuid):
 
     try:
         function_uuid = register_function(
-            user_name, function_name, description, function_code, 
+            user_name, function_name, description, function_code,
             entry_point, container_uuid, group, public)
     except Exception as e:
         message = "Function registration failed for user:{} function_name:{} due to {}".format(
@@ -905,7 +939,6 @@ def upd_function(user_name):
         function_code = request.json["code"]
         result = update_function(user_name, function_uuid, function_name,
                                  function_desc, function_entry_point, function_code)
-
 
         # app.logger.debug("[LOGGER] result: " + str(result))
         return jsonify({'result': result})
